@@ -1,0 +1,745 @@
+From fd701699b0f45ae0976343765effa76f466dbe90 Mon Sep 17 00:00:00 2001
+From: frame-cost <none@invalid>
+Date: Thu, 12 Nov 2026 22:49:18 +0300
+Subject: [PATCH] EDEN_UP_FRAME_COST=1: three log lines every 5 s that split a
+ frame's time (present side, GPU thread, textures made again); measurement
+ only, off by default
+
+With the switch unset nothing changes: each site is one cached bool check.
+
+- common/frame_cost.h (new): the windows and their lines, standard library only, so it is
+  tested off the console (tests/test_frame_cost.cpp).
+- nx2_gsv.h PresentClientBuffer: per present, the time the game ran since the last present
+  returned, the fence wait, composite and pacing, the frame's fence increments and how many of
+  them the GPU thread had not reached when the present came in.
+- hitch_trace.h: the operations it already times are also timed with this switch, and their
+  totals are logged per 5 s for every frame (EDEN_UP_HITCH_TRACE only logs frames of 100 ms or
+  more). No per-operation or per-frame line and no profile zone from this switch.
+- texture_cache.h: images made, deleted, and made again at the same address with the same
+  format, extent, levels and layers within 3600 frames of a collector's delete.
+
+Not run on a console.
+---
+ src/common/frame_cost.h                       | 471 ++++++++++++++++++
+ src/core/hle/service/nx2_gsv.h                |  34 ++
+ src/video_core/hitch_trace.h                  |  35 +-
+ src/video_core/texture_cache/texture_cache.h  |  25 +
+ .../texture_cache/texture_cache_base.h        |   3 +
+ 5 files changed, 563 insertions(+), 5 deletions(-)
+ create mode 100644 src/common/frame_cost.h
+
+diff --git a/src/common/frame_cost.h b/src/common/frame_cost.h
+new file mode 100644
+index 0000000..3f27088
+--- /dev/null
++++ b/src/common/frame_cost.h
+@@ -0,0 +1,471 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <memory>
++#include <new>
++#include <string>
++#include <vector>
++
++#include "common/pe_switch.h"
++
++// EDEN_UP_FRAME_COST=1 (exact "1", off without it): three log lines every 5 s that say where a
++// frame's time goes. Measurement only: nothing is waited for, skipped or kept because of it.
++//
++//   Frame cost (present): the game's side. A frame is split into the time the game ran between
++//       two presents and the time its present was blocked (fence wait, composite, pacing), with
++//       how far the GPU thread was behind when the present came in.
++//   Frame cost (GPU thread): the emulator's side. A frame of the GPU thread (TickFrame to
++//       TickFrame) is split by the operations video_core/hitch_trace.h times; the rest is draws,
++//       command parsing and pipeline work.
++//   Frame cost (textures): images made and deleted, and how many of the images made are the same
++//       address and shape a collector deleted shortly before (made again = collector thrash).
++//
++// Nothing here may end the app: the console's allocator throws when memory is gone, so every
++// function that allocates catches and returns an empty line.
++namespace Common::FrameCost {
++
++using Clock = std::chrono::steady_clock;
++
++inline bool On() noexcept {
++    static const bool on = PeSwitch("EDEN_UP_FRAME_COST");
++    return on;
++}
++
++inline constexpr std::uint64_t WindowNs = 5'000'000'000ULL;
++
++namespace Detail {
++
++inline void Append(std::string& out, const char* format, ...) {
++    char text[384];
++    va_list args;
++    va_start(args, format);
++    const int n = std::vsnprintf(text, sizeof(text), format, args);
++    va_end(args);
++    if (n > 0) {
++        out.append(text, (std::min)(static_cast<std::size_t>(n), sizeof(text) - 1));
++    }
++}
++
++inline std::uint64_t NsBetween(Clock::time_point from, Clock::time_point to) noexcept {
++    return to > from ? static_cast<std::uint64_t>(
++                           std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count())
++                     : 0;
++}
++
++/// Values of one window: sum and maximum of all, percentiles of the first `Keep` of them.
++class Series {
++public:
++    static constexpr std::size_t Keep = 2048;
++
++    void Add(std::uint32_t value) noexcept {
++        sum += value;
++        ++count;
++        worst = (std::max)(worst, value);
++        if (!reserved) {
++            reserved = true;
++            try {
++                values.reserve(Keep);
++            } catch (...) {
++            }
++        }
++        if (values.size() < values.capacity()) {
++            values.push_back(value);
++        }
++    }
++
++    [[nodiscard]] double Mean() const noexcept {
++        return count != 0 ? static_cast<double>(sum) / static_cast<double>(count) : 0.0;
++    }
++
++    /// The value `percent` percent of the kept values are at or below (0 with none kept).
++    [[nodiscard]] std::uint32_t Percentile(unsigned percent) noexcept {
++        if (values.empty()) {
++            return 0;
++        }
++        const std::size_t index = (std::min)(values.size() * percent / 100, values.size() - 1);
++        std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(index),
++                         values.end());
++        return values[index];
++    }
++
++    void Clear() noexcept {
++        values.clear();
++        sum = 0;
++        count = 0;
++        worst = 0;
++    }
++
++    std::uint64_t sum{};
++    std::uint64_t count{};
++    std::uint32_t worst{};
++
++private:
++    std::vector<std::uint32_t> values;
++    bool reserved{};
++};
++
++} // namespace Detail
++
++/// One present, as PresentClientBuffer saw it. Times in microseconds.
++struct PresentSample {
++    std::uint32_t game_us{};      ///< From the previous present's return to this one's entry
++    std::uint32_t fence_us{};     ///< Blocked until the wait for the GPU thread ended
++    std::uint32_t composite_us{};
++    std::uint32_t pace_us{};
++    std::uint32_t increments{};   ///< Fence increments of this frame (0: unknown)
++    std::uint32_t behind{};       ///< Increments the GPU thread still had to reach at entry
++    bool game_valid{};            ///< False for the first present
++    bool reached_at_entry{};      ///< The fence was already reached when the present came in
++    bool returned_before_fence{}; ///< The present returned with its frame unfinished
++};
++
++class PresentWindow {
++public:
++    /// Adds a present that came in at `entered`. Returns the window's line when it ends.
++    [[nodiscard]] std::string Add(Clock::time_point entered, const PresentSample& sample) noexcept {
++        try {
++            if (!started) {
++                started = true;
++                start = entered;
++            } else {
++                frame.Add(static_cast<std::uint32_t>(
++                    (std::min<std::uint64_t>)(Detail::NsBetween(last, entered) / 1000, UINT32_MAX)));
++            }
++            last = entered;
++            if (sample.game_valid) {
++                game.Add(sample.game_us);
++            }
++            fence.Add(sample.fence_us);
++            composite.Add(sample.composite_us);
++            pace.Add(sample.pace_us);
++            if (sample.increments != 0) {
++                increments.Add(sample.increments);
++                behind.Add(sample.behind);
++                behind_share_sum += (std::min)(
++                    1.0, static_cast<double>(sample.behind) / static_cast<double>(sample.increments));
++            }
++            reached_at_entry += sample.reached_at_entry ? 1 : 0;
++            returned_before_fence += sample.returned_before_fence ? 1 : 0;
++            ++presents;
++            const std::uint64_t ns = Detail::NsBetween(start, entered);
++            if (ns < WindowNs) {
++                return {};
++            }
++            std::string line = Line(static_cast<double>(ns) / 1e9);
++            Reset(entered);
++            return line;
++        } catch (...) {
++            return {};
++        }
++    }
++
++private:
++    [[nodiscard]] std::string Line(double seconds) {
++        std::string out;
++        out.reserve(640);
++        const double ms = 1.0 / 1000.0;
++        Detail::Append(out, "Frame cost (present) %.1f s: %llu presents, %.1f fps", seconds,
++                       static_cast<unsigned long long>(presents),
++                       seconds > 0 ? static_cast<double>(frame.count) / seconds : 0.0);
++        Detail::Append(out,
++                       " | frame %.1f ms = game %.1f + fence wait %.1f + composite %.1f + pacing "
++                       "%.1f",
++                       frame.Mean() * ms, game.Mean() * ms, fence.Mean() * ms,
++                       composite.Mean() * ms, pace.Mean() * ms);
++        Detail::Append(out, " | fence wait p50 %.1f p99 %.1f max %.1f ms",
++                       fence.Percentile(50) * ms, fence.Percentile(99) * ms, fence.worst * ms);
++        Detail::Append(out, " | game p50 %.1f p99 %.1f max %.1f ms", game.Percentile(50) * ms,
++                       game.Percentile(99) * ms, game.worst * ms);
++        if (increments.count != 0) {
++            Detail::Append(out,
++                           " | %.1f fence increments a frame, GPU thread %.1f behind at the "
++                           "present (%.0f%% of the frame)",
++                           increments.Mean(), behind.Mean(),
++                           100.0 * behind_share_sum / static_cast<double>(increments.count));
++        }
++        Detail::Append(out, " | fence reached at entry %llu, returned before the fence %llu",
++                       static_cast<unsigned long long>(reached_at_entry),
++                       static_cast<unsigned long long>(returned_before_fence));
++        return out;
++    }
++
++    void Reset(Clock::time_point now) noexcept {
++        frame.Clear();
++        game.Clear();
++        fence.Clear();
++        composite.Clear();
++        pace.Clear();
++        increments.Clear();
++        behind.Clear();
++        behind_share_sum = 0;
++        reached_at_entry = 0;
++        returned_before_fence = 0;
++        presents = 0;
++        start = now;
++    }
++
++    Detail::Series frame, game, fence, composite, pace, increments, behind;
++    double behind_share_sum{};
++    std::uint64_t reached_at_entry{};
++    std::uint64_t returned_before_fence{};
++    std::uint64_t presents{};
++    Clock::time_point start{};
++    Clock::time_point last{};
++    bool started{};
++};
++
++/// What one kind of operation cost in one GPU-thread frame.
++struct KindTotal {
++    const char* name{};
++    std::uint64_t ns{};
++    std::uint64_t count{};
++    std::uint64_t bytes{};
++    bool nested{}; ///< Runs inside another kind: listed, not added to the traced sum
++};
++
++class GpuWindow {
++public:
++    static constexpr std::size_t MaxKinds = 16;
++
++    /// Adds a GPU-thread frame that ended at `now` and took `wall_ns`. Returns the window's line
++    /// when it ends.
++    [[nodiscard]] std::string AddFrame(Clock::time_point now, std::uint64_t wall_ns,
++                                       const KindTotal* kinds, std::size_t kind_count) noexcept {
++        try {
++            if (!started) {
++                started = true;
++                start = now;
++            }
++            used = (std::min)(kind_count, MaxKinds);
++            for (std::size_t i = 0; i < used; ++i) {
++                totals[i].name = kinds[i].name;
++                totals[i].nested = kinds[i].nested;
++                totals[i].ns += kinds[i].ns;
++                totals[i].count += kinds[i].count;
++                totals[i].bytes += kinds[i].bytes;
++            }
++            wall_sum += wall_ns;
++            worst = (std::max)(worst, wall_ns);
++            over_30fps += wall_ns > 33'333'333ULL ? 1 : 0;
++            over_15fps += wall_ns > 66'666'667ULL ? 1 : 0;
++            ++frames;
++            const std::uint64_t ns = Detail::NsBetween(start, now);
++            if (ns < WindowNs) {
++                return {};
++            }
++            std::string line = Line(static_cast<double>(ns) / 1e9);
++            totals = {};
++            wall_sum = worst = over_30fps = over_15fps = frames = 0;
++            start = now;
++            return line;
++        } catch (...) {
++            return {};
++        }
++    }
++
++private:
++    [[nodiscard]] std::string Line(double seconds) {
++        std::string out;
++        out.reserve(1024);
++        const double n = static_cast<double>(frames);
++        const auto per_frame_ms = [n](std::uint64_t ns) { return static_cast<double>(ns) / n / 1e6; };
++        Detail::Append(out,
++                       "Frame cost (GPU thread) %.1f s: %llu frames, mean %.1f ms, worst %.1f ms, "
++                       "%llu over 33.3 ms, %llu over 66.7 ms | per frame:",
++                       seconds, static_cast<unsigned long long>(frames), per_frame_ms(wall_sum),
++                       static_cast<double>(worst) / 1e6, static_cast<unsigned long long>(over_30fps),
++                       static_cast<unsigned long long>(over_15fps));
++        std::array<std::size_t, MaxKinds> order{};
++        for (std::size_t i = 0; i < used; ++i) {
++            order[i] = i;
++        }
++        std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(used),
++                  [this](std::size_t a, std::size_t b) { return totals[a].ns > totals[b].ns; });
++        std::uint64_t traced = 0;
++        for (const bool nested : {false, true}) {
++            for (std::size_t k = 0; k < used; ++k) {
++                const KindTotal& kind = totals[order[k]];
++                if (kind.nested != nested || kind.count == 0) {
++                    continue;
++                }
++                if (!nested) {
++                    traced += kind.ns;
++                }
++                Detail::Append(out, " %s%s %.2f ms (%.1f, %.2f MiB)%s |", nested ? "[inside: " : "",
++                               kind.name != nullptr ? kind.name : "?", per_frame_ms(kind.ns),
++                               static_cast<double>(kind.count) / n,
++                               static_cast<double>(kind.bytes) / n / (1024.0 * 1024.0),
++                               nested ? "]" : "");
++            }
++        }
++        Detail::Append(out, " untraced %.2f ms (draws, command parsing, pipelines)",
++                       per_frame_ms(wall_sum - (std::min)(traced, wall_sum)));
++        return out;
++    }
++
++    std::array<KindTotal, MaxKinds> totals{};
++    std::size_t used{};
++    std::uint64_t wall_sum{};
++    std::uint64_t worst{};
++    std::uint64_t over_30fps{};
++    std::uint64_t over_15fps{};
++    std::uint64_t frames{};
++    Clock::time_point start{};
++    bool started{};
++};
++
++/// Counts images made again at the address and with the shape of one deleted shortly before.
++class RemadeTracker {
++public:
++    /// Longest gap, in texture cache frames, between a delete and a make that counts as "again".
++    static constexpr std::uint64_t MaxGap = 3600;
++
++    void NoteDelete(std::uint64_t address, std::uint64_t shape, std::uint64_t frame,
++                    bool by_collector) noexcept {
++        ++deleted;
++        deleted_by_collector += by_collector ? 1 : 0;
++        if (!Ready()) {
++            return;
++        }
++        // The slot of the same image, else a free one, else the oldest of the probes.
++        Slot* target = nullptr;
++        for (std::size_t probe = 0; probe < Probes; ++probe) {
++            Slot& slot = (*slots)[(Hash(address) + probe) & (Slots - 1)];
++            if (slot.used && slot.address == address && slot.shape == shape) {
++                target = &slot;
++                break;
++            }
++            if (target == nullptr || (target->used && (!slot.used || slot.frame < target->frame))) {
++                target = &slot;
++            }
++        }
++        *target = Slot{address, shape, frame, true, by_collector};
++    }
++
++    void NoteCreate(std::uint64_t address, std::uint64_t shape, std::uint64_t frame,
++                    std::uint64_t bytes) noexcept {
++        ++made;
++        made_bytes += bytes;
++        if (!Ready()) {
++            return;
++        }
++        for (std::size_t probe = 0; probe < Probes; ++probe) {
++            Slot& slot = (*slots)[(Hash(address) + probe) & (Slots - 1)];
++            if (!slot.used || slot.address != address || slot.shape != shape) {
++                continue;
++            }
++            slot.used = false;
++            const std::uint64_t gap_frames = frame >= slot.frame ? frame - slot.frame : 0;
++            if (gap_frames > MaxGap) {
++                return;
++            }
++            if (slot.by_collector) {
++                ++again;
++                again_bytes += bytes;
++                gap.Add(static_cast<std::uint32_t>(gap_frames));
++            } else {
++                ++again_other;
++            }
++            return;
++        }
++    }
++
++    /// Once per texture cache frame. Returns the window's line when it ends.
++    [[nodiscard]] std::string Tick(Clock::time_point now) noexcept {
++        try {
++            if (!started) {
++                started = true;
++                start = now;
++                return {};
++            }
++            const std::uint64_t ns = Detail::NsBetween(start, now);
++            if (ns < WindowNs) {
++                return {};
++            }
++            std::string out;
++            out.reserve(384);
++            const double mib = 1.0 / (1024.0 * 1024.0);
++            Detail::Append(out,
++                           "Frame cost (textures) %.1f s: %llu images made (%.1f MiB of guest "
++                           "data), %llu deleted (%llu by a collector)",
++                           static_cast<double>(ns) / 1e9, static_cast<unsigned long long>(made),
++                           static_cast<double>(made_bytes) * mib,
++                           static_cast<unsigned long long>(deleted),
++                           static_cast<unsigned long long>(deleted_by_collector));
++            Detail::Append(out,
++                           " | made again after a collector's delete: %llu (%.0f%% of made, %.1f "
++                           "MiB), %u frames later at the median, %u at the 90th percentile",
++                           static_cast<unsigned long long>(again),
++                           made != 0 ? 100.0 * static_cast<double>(again) / static_cast<double>(made)
++                                     : 0.0,
++                           static_cast<double>(again_bytes) * mib, gap.Percentile(50),
++                           gap.Percentile(90));
++            Detail::Append(out, " | made again after another delete: %llu%s",
++                           static_cast<unsigned long long>(again_other),
++                           slots ? "" : " | no table (out of memory): again counts are 0");
++            made = made_bytes = deleted = deleted_by_collector = again = again_bytes = again_other = 0;
++            gap.Clear();
++            start = now;
++            return out;
++        } catch (...) {
++            return {};
++        }
++    }
++
++private:
++    static constexpr std::size_t Slots = 16384; // power of two
++    static constexpr std::size_t Probes = 8;
++
++    struct Slot {
++        std::uint64_t address{};
++        std::uint64_t shape{};
++        std::uint64_t frame{};
++        bool used{};
++        bool by_collector{};
++    };
++
++    [[nodiscard]] static std::size_t Hash(std::uint64_t address) noexcept {
++        return static_cast<std::size_t>((address * 0x9E3779B97F4A7C15ULL) >> 40);
++    }
++
++    [[nodiscard]] bool Ready() noexcept {
++        if (!slots && !tried) {
++            tried = true;
++            slots.reset(new (std::nothrow) std::array<Slot, Slots>{});
++        }
++        return slots != nullptr;
++    }
++
++    std::unique_ptr<std::array<Slot, Slots>> slots;
++    bool tried{};
++    std::uint64_t made{};
++    std::uint64_t made_bytes{};
++    std::uint64_t deleted{};
++    std::uint64_t deleted_by_collector{};
++    std::uint64_t again{};
++    std::uint64_t again_bytes{};
++    std::uint64_t again_other{};
++    Detail::Series gap;
++    Clock::time_point start{};
++    bool started{};
++};
++
++/// A shape word for RemadeTracker from an image's format and extent.
++[[nodiscard]] constexpr std::uint64_t Shape(std::uint32_t format, std::uint32_t width,
++                                            std::uint32_t height, std::uint32_t depth,
++                                            std::uint32_t levels, std::uint32_t layers) noexcept {
++    std::uint64_t word = format;
++    for (const std::uint32_t part : {width, height, depth, levels, layers}) {
++        word = (word ^ part) * 0x100000001B3ULL;
++    }
++    return word;
++}
++
++} // namespace Common::FrameCost
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index dccda9e..2ecffdc 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -28,6 +28,7 @@
+ 
+ #include "common/alignment.h"
+ #include "common/div_ceil.h"
++#include "common/frame_cost.h"
+ #include "common/game_presets.h"
+ #include "common/live_switch.h"
+ #include "common/nx2_load_wait.h"
+@@ -1965,6 +1966,21 @@ private:
+             VideoCore::Readback::g_present_number.store(m_presents, std::memory_order_release);
+         }
+         const auto entered = std::chrono::steady_clock::now();
++        // EDEN_UP_FRAME_COST (common/frame_cost.h): where the GPU thread is when the present
++        // comes in, read before any wait. Log only.
++        static const bool frame_cost = Common::FrameCost::On();
++        Common::FrameCost::PresentSample cost_sample{};
++        if (frame_cost && ~w[22] < 192) [[unlikely]] {
++            const u32 now_value =
++                system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]);
++            const s32 behind = static_cast<s32>(w[24] - now_value);
++            cost_sample.behind = behind > 0 ? static_cast<u32>(behind) : 0U;
++            cost_sample.reached_at_entry = behind <= 0;
++            if (m_previous_fence_id == ~w[22]) {
++                const s32 increments = static_cast<s32>(w[24] - m_previous_fence_value);
++                cost_sample.increments = increments > 0 ? static_cast<u32>(increments) : 0U;
++            }
++        }
+         if (front_wait) [[unlikely]] {
+             WaitForFrameFront(~w[22], w[24]);
+             if (ubo_snapshot) {
+@@ -2050,6 +2066,21 @@ private:
+             if (ran_ahead_now) {
+                 ++m_stats.ran_ahead;
+             }
++            if (frame_cost) [[unlikely]] {
++                const auto clamp_us = [&to_us](auto d) {
++                    return static_cast<u32>((std::clamp<long long>)(to_us(d), 0, UINT32_MAX));
++                };
++                cost_sample.game_valid = m_cost_returned != std::chrono::steady_clock::time_point{};
++                cost_sample.game_us = cost_sample.game_valid ? clamp_us(entered - m_cost_returned) : 0U;
++                cost_sample.fence_us = clamp_us(waited - entered);
++                cost_sample.composite_us = clamp_us(composited - waited);
++                cost_sample.pace_us = clamp_us(paced - composited);
++                cost_sample.returned_before_fence = ran_ahead_now;
++                if (const std::string line = m_cost_window.Add(entered, cost_sample); !line.empty()) {
++                    LOG_INFO(Service, "{}", line);
++                }
++                m_cost_returned = paced;
++            }
+             // EDEN_UP_LANDING_TRACE (video_core/landing_trace.h): the downloads that land from
+             // here on are logged against this present.
+             if (VideoCommon::LandingTrace::Enabled()) [[unlikely]] {
+@@ -2144,6 +2175,9 @@ private:
+         u32 presents{}, ran_ahead{};
+         std::chrono::steady_clock::time_point last_present{};
+     } m_stats{};
++    // EDEN_UP_FRAME_COST: the current 5 s window, and when the last present went back to the game.
++    Common::FrameCost::PresentWindow m_cost_window{};
++    std::chrono::steady_clock::time_point m_cost_returned{};
+     // EDEN_GBB_FPS_5S: frame times of the current 5 s window (cleared, not freed, each window).
+     struct FpsWindow {
+         std::vector<long long> frames_us;
+diff --git a/src/video_core/hitch_trace.h b/src/video_core/hitch_trace.h
+index 7cce680..2d00ecb 100644
+--- a/src/video_core/hitch_trace.h
++++ b/src/video_core/hitch_trace.h
+@@ -11,6 +11,7 @@
+ #include <fmt/format.h>
+ 
+ #include "common/common_types.h"
++#include "common/frame_cost.h"
+ #include "common/logging.h"
+ #include "common/pe_switch.h"
+ #include "video_core/nx2_profile.h"
+@@ -76,6 +77,13 @@ inline bool On() {
+ }
+ 
+ /// What an operation was, formatted only when it is logged.
++/// EDEN_UP_FRAME_COST=1 (common/frame_cost.h): the same operations are timed and their totals
++/// logged every 5 s for every frame, not only the long ones. No line per operation or per frame.
++inline bool CostOn() {
++    static const bool on = Common::FrameCost::On();
++    return on;
++}
++
+ struct Desc {
+     u64 addr{}; ///< Guest address, 0: none
+     u64 a{};    ///< Images: width. Buffer upload: copies. Staging: usage.
+@@ -128,6 +136,7 @@ struct FrameData {
+ };
+ 
+ inline thread_local FrameData t_frame;
++inline thread_local Common::FrameCost::GpuWindow t_cost_window;
+ 
+ /// The profile zone an operation also counts under (EDEN_NX2_GPU_PROFILE); image uploads are
+ /// already the "texture upload" zone.
+@@ -156,11 +165,12 @@ inline Nx2Profile::Zone ZoneOf(Kind kind) {
+ /// Times one operation on the calling thread from its making to End() or its destruction.
+ class Op {
+ public:
+-    Op(Kind kind_, u64 bytes_, Desc desc_) : kind{kind_}, bytes{bytes_}, desc{desc_}, on{On()} {
++    Op(Kind kind_, u64 bytes_, Desc desc_)
++        : kind{kind_}, bytes{bytes_}, desc{desc_}, on{On() || CostOn()} {
+         if (!on) {
+             return;
+         }
+-        if (kind_ != Kind::ImageUpload) {
++        if (On() && kind_ != Kind::ImageUpload) {
+             zone.emplace(ZoneOf(kind_));
+         }
+         start = std::chrono::steady_clock::now();
+@@ -192,7 +202,7 @@ public:
+             data.worst_bytes = bytes;
+             data.worst = desc;
+         }
+-        if (elapsed >= op_log_ns[index]) {
++        if (On() && elapsed >= op_log_ns[index]) {
+             LOG_INFO(HW_GPU, "Hitch trace: {}: {} took {:.1f} ms", names[index],
+                      Describe(kind, bytes, desc), static_cast<double>(elapsed) / 1e6);
+         }
+@@ -211,7 +221,7 @@ private:
+ /// Called once per frame on the GPU thread (TextureCache::TickFrame): logs the frame that just
+ /// ended when it was long, and starts the next.
+ inline void EndFrame(u64 frame_number) {
+-    if (!On()) {
++    if (!On() && !CostOn()) {
+         return;
+     }
+     FrameData& frame = t_frame;
+@@ -219,7 +229,22 @@ inline void EndFrame(u64 frame_number) {
+     if (frame.started) {
+         const auto wall = static_cast<u64>(
+             std::chrono::duration_cast<std::chrono::nanoseconds>(now - frame.start).count());
+-        if (wall >= frame_log_ns) {
++        if (CostOn()) {
++            // The kinds that run inside another one are the ones EndFrame leaves out of "traced".
++            std::array<Common::FrameCost::KindTotal, static_cast<size_t>(Kind::Count)> totals{};
++            for (size_t i = 0; i < totals.size(); ++i) {
++                const KindData& data = frame.kinds[i];
++                totals[i] = {plural_names[i], data.ns, data.count, data.bytes,
++                             i == static_cast<size_t>(Kind::Finish) ||
++                                 i == static_cast<size_t>(Kind::StagingMade) ||
++                                 i == static_cast<size_t>(Kind::DecodeQueue)};
++            }
++            if (const std::string line = t_cost_window.AddFrame(now, wall, totals.data(), totals.size());
++                !line.empty()) {
++                LOG_INFO(HW_GPU, "{}", line);
++            }
++        }
++        if (On() && wall >= frame_log_ns) {
+             std::array<size_t, static_cast<size_t>(Kind::Count)> order{};
+             u64 traced{};
+             for (size_t i = 0; i < order.size(); ++i) {
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 2ed7545..4f34e27 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -163,6 +163,15 @@ constexpr u64 KeepRemadeWindow = 600;
+                                 ImageFlagBits::SparseTiles));
+ }
+ 
++/// EDEN_UP_FRAME_COST (common/frame_cost.h): what makes two images "the same" for its count of
++/// images made again: format, extent, levels and layers (the address is compared apart).
++[[nodiscard]] inline u64 FrameCostShape(const ImageInfo& info) {
++    return Common::FrameCost::Shape(static_cast<u32>(info.format), info.size.width,
++                                    info.size.height, info.size.depth,
++                                    static_cast<u32>(info.resources.levels),
++                                    static_cast<u32>(info.resources.layers));
++}
++
+ /// Kept by EDEN_UP_TC_KEEP_REMADE: the collectors skip it as they skip AsynchronousDecode images
+ /// with EDEN_NX2_TC_KEEP_ASYNC. Only ever true with the switch on (InsertImage sets it).
+ [[nodiscard]] inline bool KeptRemade(const ImageBase& image) {
+@@ -1349,6 +1358,13 @@ void TextureCache<P>::TickFrame() {
+     if (pe_busy) Eden::AstcPolicy::Frame();
+     // EDEN_UP_HITCH_TRACE: the frame that just ended, when it was long.
+     HitchTrace::EndFrame(frame_tick);
++    if (Common::FrameCost::On()) [[unlikely]] {
++        // EDEN_UP_FRAME_COST: images made, deleted and made again in the last 5 s. Log only.
++        if (const std::string line = frame_cost_remade.Tick(std::chrono::steady_clock::now());
++            !line.empty()) {
++            LOG_INFO(HW_GPU, "{}", line);
++        }
++    }
+     if (CleanByTime() || RefusalEvictEnabled()) {
+         frame_clock.EndFrame(frame_tick, std::chrono::steady_clock::now());
+     }
+@@ -5012,6 +5028,10 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
+                     image.guest_size_bytes / 1024, join_overlap_ids.size(),
+                     join_overlaps_found.size(), ms, frame_tick);
+     }
++    if (Common::FrameCost::On()) [[unlikely]] {
++        frame_cost_remade.NoteCreate(image.gpu_addr, FrameCostShape(image.info), frame_tick,
++                                     image.guest_size_bytes);
++    }
+     if (KeepRemadeCandidate(image)) {
+         // EDEN_UP_TC_KEEP_REMADE: large from the start, or made again after a collector's delete.
+         const u64 decode = AstcDecodeBytes(image.info);
+@@ -6469,6 +6489,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+         // ("other" when it set none); put back for the next delete.
+         const char* const reason = trace_delete_reason;
+         trace_delete_reason = "other";
++        if (Common::FrameCost::On()) [[unlikely]] {
++            // Every collector's reason starts with "gc".
++            frame_cost_remade.NoteDelete(image.gpu_addr, FrameCostShape(image.info), frame_tick,
++                                         reason[0] == 'g' && reason[1] == 'c');
++        }
+         if (TcTrace() && image.guest_size_bytes >= TcTraceMinBytes()) {
+             LOG_WARNING(HW_GPU,
+                         "TCTRACE delete id={} gpu={:#x} fmt={} {}x{}x{} guest={}KiB immediate={} "
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 0fa914e..8c81544 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -26,6 +26,7 @@
+ #include <queue>
+ 
+ #include "common/common_types.h"
++#include "common/frame_cost.h"
+ #include "common/spin_recursive_mutex.h"
+ #include "common/hash.h"
+ #include "common/literals.h"
+@@ -265,6 +266,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
+         s32 layers;
+     };
+     std::map<GPUVAddr, KeepRemadeDeleted> keep_remade_deleted;
++    /// EDEN_UP_FRAME_COST: images made again after a delete (GPU thread only, log only).
++    Common::FrameCost::RemadeTracker frame_cost_remade;
+     u64 keep_remade_images{};  ///< Images kept now
+     u64 keep_remade_total{};   ///< Images kept so far (the log lines)
+     u64 keep_remade_deletes{}; ///< Kept images deleted so far (old pass, unmap, join)
+-- 
+2.43.0
+
