@@ -1,0 +1,299 @@
+From ad39d9d1d09b61622c5caacccc49894aba8616db Mon Sep 17 00:00:00 2001
+From: bank-check-memo <none@invalid>
+Date: Fri, 13 Nov 2026 15:44:12 +0300
+Subject: [PATCH] EDEN_UP_BANK_CHECK_MEMO=<microseconds>: a native bank
+ compared in full that recently is not compared again at this bind (live
+ switch; unset = every bind compares, as before); EDEN_UP_FRAME_COST counts
+ and times the bank checks
+
+EDEN_NX2_BANK_REUPLOAD=4 runs BufferCache::Nx2CheckBankPages at every bind of a 64 KiB native
+bank: per page two device memory lookups, a hash map lookup and a 4 KiB memcmp, for every stage
+of every draw that binds one. On a base PS5 (T120, Ocarina of Time, 13 Nov) the GPU profile put
+150 to 190 ms a second in 'bind stage buffers', about 3 us a call at 50,000 to 60,000 calls a
+second, the largest zone of the drawing thread after the methods. Whether that time is these
+checks is what the new 'Frame cost (banks)' line says; it is not known yet.
+
+With the switch a check is left out when all of the same bank (address, size, device memory
+mapping) was compared less than the given time ago. Bytes the tracker missed that the game
+wrote in between are found by the next check, at most that much later; the pages marked and
+the test that marks them are unchanged. Forgetting the snapshots clears the memo, and
+EDEN_NX2_BANK_STATS never skips.
+
+- video_core/buffer_cache/bank_check_memo.h (new): the memo and the 5 s line, standard library
+  only, tested off the console.
+- common/live_switch.h: the switch (index 15), so a schedule can turn it on and off in a run.
+- buffer_cache.h, buffer_cache_base.h: the memo around the check, the counters, the line.
+
+Not run on a console.
+---
+ src/common/live_switch.h                      |  19 ++++
+ src/video_core/buffer_cache/bank_check_memo.h | 106 ++++++++++++++++++
+ src/video_core/buffer_cache/buffer_cache.h    |  37 ++++++
+ .../buffer_cache/buffer_cache_base.h          |   4 +
+ 4 files changed, 166 insertions(+)
+ create mode 100644 src/video_core/buffer_cache/bank_check_memo.h
+
+diff --git a/src/common/live_switch.h b/src/common/live_switch.h
+index a2031e1..396dba1 100644
+--- a/src/common/live_switch.h
++++ b/src/common/live_switch.h
+@@ -117,6 +117,9 @@ enum class Id : u8 {
+     /// present chooses on its own whether it also waits for its own frame when the GPU is
+     /// behind, as it already does from the GPU's state (core/hle/service/nx2_gsv.h).
+     AheadAlways,
++    /// EDEN_UP_BANK_CHECK_MEMO=<microseconds> (video_core/buffer_cache/bank_check_memo.h). Read at
++    /// each bank check: a check is made or left to the next one, so any value suits any moment.
++    BankCheckMemo,
+     Count,
+ };
+ 
+@@ -162,6 +165,21 @@ inline constexpr size_t NumSwitches = static_cast<size_t>(Id::Count);
+                : 0;
+ }
+ 
++/// EDEN_UP_BANK_CHECK_MEMO: microseconds, 1 to 2000; unset, 0 or anything else is 0 (off).
++[[nodiscard]] inline s64 ParseBankCheckMemo(const char* text) noexcept {
++    if (text == nullptr || text[0] == '\0') {
++        return 0;
++    }
++    s64 value = 0;
++    for (const char* at = text; *at != '\0'; ++at) {
++        if (*at < '0' || *at > '9' || value > 2000) {
++            return 0;
++        }
++        value = value * 10 + (*at - '0');
++    }
++    return value <= 2000 ? value : 0;
++}
++
+ struct Def {
+     const char* name;
+     s64 (*parse)(const char* text);
+@@ -185,6 +203,7 @@ inline constexpr std::array<Def, NumSwitches> kDefs{{
+     {"EDEN_UP_COND_BACK", ParseOneOrTwo, false, -1},
+     {"EDEN_UP_SWIZZLE_UNITS", ParseExactOne, false, -1},
+     {"EDEN_UP_AHEAD_ALWAYS", ParseExactOne, false, -1},
++    {"EDEN_UP_BANK_CHECK_MEMO", ParseBankCheckMemo, false, -1},
+ }};
+ 
+ /// EDEN_UP_LIVE_SWITCHES=1 (exact "1"), read once.
+diff --git a/src/video_core/buffer_cache/bank_check_memo.h b/src/video_core/buffer_cache/bank_check_memo.h
+new file mode 100644
+index 0000000..4ab215d
+--- /dev/null
++++ b/src/video_core/buffer_cache/bank_check_memo.h
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <cstdarg>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++
++// EDEN_NX2_BANK_REUPLOAD=4 compares every page of a 64 KiB native bank with its snapshot at every
++// bind of the bank (BufferCache::Nx2CheckBankPages): two device memory lookups, a hash map lookup
++// and a 4 KiB memcmp per page, for every stage of every draw that binds one.
++//
++// EDEN_UP_BANK_CHECK_MEMO=<microseconds> (1 to 2000; unset or 0: off, every bind checks as
++// before; a live switch): a bank whose pages were all compared less than that long ago is not
++// compared again at this bind. What a skipped check would have found (bytes the game wrote in
++// those microseconds that the memory tracker missed) is found by the next check instead, at most
++// that much later. Nothing else changes: the same pages are marked, by the same test.
++//
++// With EDEN_UP_FRAME_COST=1 the checks are counted and timed, switch on or off
++// ("Frame cost (banks)" every 5 s). Log only.
++namespace VideoCommon {
++
++class BankCheckMemo {
++public:
++    /// Whether all of this bank was compared less than `window_ns` before `now_ns`, with the
++    /// device memory mapping (`generation`) it has now.
++    [[nodiscard]] bool Recent(std::uint64_t address, std::uint64_t size, std::uint64_t now_ns,
++                              std::uint64_t window_ns, std::uint64_t generation) const noexcept {
++        const Entry& entry = entries[Slot(address)];
++        return entry.size != 0 && entry.address == address && entry.size == size &&
++               entry.generation == generation && now_ns >= entry.checked_ns &&
++               now_ns - entry.checked_ns < window_ns;
++    }
++
++    /// All of this bank's pages were just compared.
++    void Note(std::uint64_t address, std::uint64_t size, std::uint64_t now_ns,
++              std::uint64_t generation) noexcept {
++        entries[Slot(address)] = Entry{address, size, now_ns, generation};
++    }
++
++    /// The snapshots were dropped: every bank is compared again.
++    void Clear() noexcept {
++        entries = {};
++    }
++
++private:
++    static constexpr std::size_t Slots = 64; // power of two
++
++    struct Entry {
++        std::uint64_t address{};
++        std::uint64_t size{}; ///< 0: empty
++        std::uint64_t checked_ns{};
++        std::uint64_t generation{};
++    };
++
++    [[nodiscard]] static std::size_t Slot(std::uint64_t address) noexcept {
++        // Banks are page aligned or close to it: drop the page offset before mixing.
++        return static_cast<std::size_t>(((address >> 12) * 0x9E3779B97F4A7C15ULL) >> 58);
++    }
++
++    std::array<Entry, Slots> entries{};
++};
++
++/// EDEN_UP_FRAME_COST: what the bank checks did in the current 5 s.
++struct BankCheckStats {
++    std::uint64_t checks{};       ///< Checks that compared pages
++    std::uint64_t skipped{};      ///< Checks left out by EDEN_UP_BANK_CHECK_MEMO
++    std::uint64_t pages{};        ///< Pages compared
++    std::uint64_t changed{};      ///< Pages that differed from their snapshot (new ones included)
++    std::uint64_t ns{};           ///< Time in the checks that compared pages
++    std::uint64_t window_start{}; ///< 0: not started
++
++    /// Once per buffer cache frame. Returns the window's line when 5 s have passed, else empty.
++    [[nodiscard]] std::string Tick(std::uint64_t now_ns, std::int64_t memo_us) noexcept {
++        if (window_start == 0) {
++            window_start = now_ns;
++            return {};
++        }
++        if (now_ns < window_start || now_ns - window_start < 5'000'000'000ULL) {
++            return {};
++        }
++        const double seconds = static_cast<double>(now_ns - window_start) / 1e9;
++        char text[448];
++        const int n = std::snprintf(
++            text, sizeof(text),
++            "Frame cost (banks) %.1f s: %.0f bank checks a second took %.1f ms a second "
++            "(%.2f us each, %.1f pages each), %.0f pages a second changed | %.0f checks a second "
++            "skipped (EDEN_UP_BANK_CHECK_MEMO=%lld us)",
++            seconds, static_cast<double>(checks) / seconds, static_cast<double>(ns) / 1e6 / seconds,
++            checks != 0 ? static_cast<double>(ns) / 1e3 / static_cast<double>(checks) : 0.0,
++            checks != 0 ? static_cast<double>(pages) / static_cast<double>(checks) : 0.0,
++            static_cast<double>(changed) / seconds, static_cast<double>(skipped) / seconds,
++            static_cast<long long>(memo_us));
++        checks = skipped = pages = changed = ns = 0;
++        window_start = now_ns;
++        try {
++            return n > 0 ? std::string{text} : std::string{};
++        } catch (...) {
++            return {};
++        }
++    }
++};
++
++} // namespace VideoCommon
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 21aeb11..cc80f85 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -7,6 +7,8 @@
+ #pragma once
+ 
+ #include "common/cityhash.h"
++#include "common/frame_cost.h"
++#include "common/live_switch.h"
+ #include "common/pe_switch.h"
+ #include "video_core/readback_wait.h"
+ #include <algorithm>
+@@ -165,6 +167,15 @@ void BufferCache<P>::TickFrame() {
+     }
+     runtime.TickFrame(slot_buffers);
+     native_indirect_uniforms_this_frame.clear();
++    if (Common::FrameCost::On()) [[unlikely]] {
++        // EDEN_UP_FRAME_COST: the bank checks of the last 5 s (bank_check_memo.h). Log only.
++        if (const std::string line = nx2_bank_check_stats.Tick(
++                Nx2Profile::Now(),
++                Common::LiveSwitch::Value<Common::LiveSwitch::Id::BankCheckMemo>());
++            !line.empty()) {
++            LOG_INFO(HW_GPU, "{}", line);
++        }
++    }
+     if (Nx2BankHashSkip() && frame_tick % 600 == 0) [[unlikely]] {
+         const Nx2BankHashStats& st = nx2_bank_hash_stats;
+         LOG_INFO(HW_GPU,
+@@ -3525,6 +3536,18 @@ void BufferCache<P>::Nx2BankFlagPages(DAddr device_addr, u64 size) {
+ 
+ template <class P>
+ void BufferCache<P>::Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, bool stats) {
++    // EDEN_UP_BANK_CHECK_MEMO (bank_check_memo.h): a bank compared in full less than that many
++    // microseconds ago is left to its next check. EDEN_UP_FRAME_COST counts and times the checks.
++    const bool cost = Common::FrameCost::On();
++    const s64 memo_us = Common::LiveSwitch::Value<Common::LiveSwitch::Id::BankCheckMemo>();
++    const u64 check_start = cost || memo_us != 0 ? Nx2Profile::Now() : 0;
++    const u64 memo_generation = memo_us != 0 ? device_memory.TranslationGeneration() : 0;
++    if (memo_us != 0 && !stats &&
++        nx2_bank_check_memo.Recent(device_addr, size, check_start,
++                                   static_cast<u64>(memo_us) * 1000, memo_generation)) {
++        ++nx2_bank_check_stats.skipped;
++        return;
++    }
+     // The bank size is only an upper limit: stop at the end of the mapped memory.
+     u64 mapped_size = 0;
+     while (mapped_size < size &&
+@@ -3561,6 +3584,7 @@ void BufferCache<P>::Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, b
+                      clears);
+         }
+         native_indirect_page_snapshots.clear();
++        nx2_bank_check_memo.Clear();
+     }
+     const DAddr first_page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+     const DAddr end = device_addr + check_size;
+@@ -3573,6 +3597,10 @@ void BufferCache<P>::Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, b
+         Nx2BankPage& snapshot = it->second;
+         const bool same =
+             !inserted && std::memcmp(snapshot.bytes.data(), guest, Core::DEVICE_PAGESIZE) == 0;
++        if (cost) [[unlikely]] {
++            ++nx2_bank_check_stats.pages;
++            nx2_bank_check_stats.changed += same ? 0 : 1;
++        }
+         if (stats) {
+             static std::array<u64, 3> counts{};
+             static std::array<u64, 4> changed_state{};
+@@ -3645,6 +3673,15 @@ void BufferCache<P>::Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, b
+             snapshot.epoch = memory_tracker.CpuWriteEpoch(page, Core::DEVICE_PAGESIZE);
+         }
+     }
++    if (memo_us != 0) {
++        // From before the pages were compared: what the game wrote during the check is not
++        // older than the window either.
++        nx2_bank_check_memo.Note(device_addr, size, check_start, memo_generation);
++    }
++    if (cost) [[unlikely]] {
++        ++nx2_bank_check_stats.checks;
++        nx2_bank_check_stats.ns += Nx2Profile::Now() - check_start;
++    }
+ }
+ 
+ template <class P>
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 66c0244..055bd9b 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -38,6 +38,7 @@
+ #include "common/settings.h"
+ #include "common/slot_vector.h"
+ #include "shader_recompiler/storage_write_extent.h"
++#include "video_core/buffer_cache/bank_check_memo.h"
+ #include "video_core/buffer_cache/buffer_base.h"
+ #include "video_core/buffer_cache/uniform_stream_reuse.h"
+ #include "video_core/ahead_guard.h"
+@@ -598,6 +599,9 @@ public:
+         u64 epoch{};
+     };
+     std::unordered_map<DAddr, Nx2BankPage> native_indirect_page_snapshots;
++    /// EDEN_UP_BANK_CHECK_MEMO and EDEN_UP_FRAME_COST's count of the checks (bank_check_memo.h).
++    VideoCommon::BankCheckMemo nx2_bank_check_memo;
++    VideoCommon::BankCheckStats nx2_bank_check_stats;
+     /// Compares each page of a bank with its snapshot (EDEN_NX2_BANK_REUPLOAD=4 marks the ones
+     /// that changed as CPU modified, EDEN_NX2_BANK_STATS=1 logs what it finds).
+     void Nx2CheckBankPages(DAddr device_addr, u64 size, bool mark, bool stats);
+-- 
+2.43.0
+
