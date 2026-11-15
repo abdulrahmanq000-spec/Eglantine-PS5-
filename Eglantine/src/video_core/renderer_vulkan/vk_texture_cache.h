@@ -322,6 +322,10 @@ public:
 
     static constexpr size_t indexing_slots = 8 * sizeof(size_t);
     std::array<vk::Buffer, indexing_slots> buffers{};
+    /// GetTemporaryBuffer: the tick each copy buffer was last recorded for, and the frames since
+    /// (EDEN_NX2_TC_TEMP_BUFFER_FRAMES).
+    std::array<u64, indexing_slots> buffer_ticks{};
+    std::array<u32, indexing_slots> buffer_unused_frames{};
     struct MsaaScratchKey {
         VkFormat format;
         VkImageType type;

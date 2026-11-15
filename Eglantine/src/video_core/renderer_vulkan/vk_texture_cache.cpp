@@ -1387,6 +1387,8 @@ bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) {
 
 VkBuffer TextureCacheRuntime::GetTemporaryBuffer(size_t needed_size) {
     const auto level = (8 * sizeof(size_t)) - std::countl_zero(needed_size - 1ULL);
+    buffer_ticks[level] = scheduler.CurrentTick();
+    buffer_unused_frames[level] = 0;
     if (buffers[level]) {
         return *buffers[level];
     }
@@ -2997,6 +2999,33 @@ void TextureCacheRuntime::TickFrame() {
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
+    // EDEN_NX2_TC_TEMP_BUFFER_FRAMES=<frames> (unset: kept for the session, as before): a copy
+    // buffer from GetTemporaryBuffer (one per power of two, the size of the largest copy of that
+    // class so far) that no copy has used for this many frames, and that the GPU is past, is
+    // destroyed; the next copy of that size makes it again.
+    static const u32 temp_buffer_frames = [] {
+        const char* const value = std::getenv("EDEN_NX2_TC_TEMP_BUFFER_FRAMES");
+        const u32 frames = value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        if (frames != 0) {
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_TC_TEMP_BUFFER_FRAMES={}: copy buffers unused for {} frames are destroyed",
+                     value, frames);
+        }
+        return frames;
+    }();
+    if (temp_buffer_frames != 0) {
+        for (size_t level = 0; level < indexing_slots; ++level) {
+            if (!buffers[level]) {
+                continue;
+            }
+            if (++buffer_unused_frames[level] > temp_buffer_frames &&
+                scheduler.IsFree(buffer_ticks[level])) {
+                LOG_INFO(Render_Vulkan, "Copy buffer of {} MiB unused for {} frames: destroyed",
+                         (u64{1} << level) >> 20, buffer_unused_frames[level] - 1);
+                buffers[level].reset();
+                buffer_unused_frames[level] = 0;
+            }
+        }
+    }
     std::erase_if(msaa_scratch_images, [this](MsaaScratchImage& scratch) {
         if (!scheduler.IsFree(scratch.tick)) {
             scratch.unused_frames = 0;

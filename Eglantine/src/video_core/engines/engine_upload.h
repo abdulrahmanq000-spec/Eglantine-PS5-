@@ -85,6 +85,7 @@ private:
     u32 flushed_offset{};
     u32 write_offset = 0;
     u32 copy_size = 0;
+    bool refused = false;
     Common::ScratchBuffer<u8> inner_buffer;
     Common::ScratchBuffer<u8> tmp_buffer;
     bool is_linear = false;

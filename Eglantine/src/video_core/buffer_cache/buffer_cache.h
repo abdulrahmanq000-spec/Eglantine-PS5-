@@ -191,8 +191,21 @@ void BufferCache<P>::TickFrame() {
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
-        if (buffer_bytes >= 512_MiB) {
-            RunGarbageCollector(buffer_bytes >= 1_GiB);
+        // EDEN_NX2_BC_COLLECT_MIB=<MiB> (unset: 512, as before) lowers the mark: on the console
+        // Ocarina of Time's buffers held 280 to 460 MiB, so this never ran there. Below twice the
+        // mark it is the gentle collector: buffers unused for 120 frames, 32 a frame, none
+        // holding GPU-written data, so no download and no wait for the GPU.
+        static const u64 collect_mark = [] {
+            const char* const value = std::getenv("EDEN_NX2_BC_COLLECT_MIB");
+            const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+            if (mib != 0) {
+                LOG_INFO(HW_GPU, "EDEN_NX2_BC_COLLECT_MIB={}: the buffer collector runs from {} MiB, in earnest from {} MiB",
+                         value, mib, 2 * mib);
+            }
+            return (mib != 0 ? mib : u64{512}) << 20;
+        }();
+        if (buffer_bytes >= collect_mark) {
+            RunGarbageCollector(buffer_bytes >= 2 * collect_mark);
         }
     } else if (total_used_memory >= minimum_memory) {
         RunGarbageCollector(total_used_memory >= critical_memory);

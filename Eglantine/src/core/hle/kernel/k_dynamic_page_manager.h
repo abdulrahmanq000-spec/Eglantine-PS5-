@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/alignment.h"
+#include "common/logging.h"
 #include "core/hle/kernel/k_page_bitmap.h"
 #include "core/hle/kernel/k_spin_lock.h"
 #include "core/hle/kernel/k_typed_address.h"
@@ -106,6 +107,12 @@ public:
         // Find a random free block.
         s64 soffset = m_page_bitmap.FindFreeBlock(true);
         if (soffset < 0) [[unlikely]] {
+            // EglantinePS5: what a small EDEN_KERNEL_RESOURCE_MIB would show as a guest failure.
+            if (!m_said_full) {
+                m_said_full = true;
+                LOG_ERROR(Kernel, "EDEN_KERNEL_RESOURCE all {} MiB of the pages are in use",
+                          PagesInMiB(m_count));
+            }
             return nullptr;
         }
 
@@ -114,6 +121,13 @@ public:
         // Update our tracking.
         m_page_bitmap.ClearBit(offset);
         m_peak = (std::max)(m_peak, (++m_used));
+
+        // EglantinePS5: what the title's resource really takes, for EDEN_KERNEL_RESOURCE_MIB.
+        if (m_peak >= m_reported_peak + ReportPages) [[unlikely]] {
+            m_reported_peak = m_peak;
+            LOG_INFO(Kernel, "EDEN_KERNEL_RESOURCE {} MiB of {} MiB of pages used at most",
+                     PagesInMiB(m_peak), PagesInMiB(m_count));
+        }
 
         return GetPointer<PageBuffer>(m_aligned_address) + offset;
     }
@@ -157,10 +171,18 @@ public:
     }
 
 private:
+    static constexpr size_t ReportPages = (1 << 20) / PageSize;
+    // Rounded up: the bitmap takes a page, and 8 MiB of memory would read as 7.
+    static constexpr size_t PagesInMiB(size_t pages) {
+        return (pages * sizeof(PageBuffer) + (1 << 20) - 1) >> 20;
+    }
+
     KSpinLock m_lock;
     KPageBitmap m_page_bitmap;
     size_t m_used{};
     size_t m_peak{};
+    size_t m_reported_peak{};
+    bool m_said_full{};
     size_t m_count{};
     KVirtualAddress m_address{};
     KVirtualAddress m_aligned_address{};
