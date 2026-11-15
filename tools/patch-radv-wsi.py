@@ -74,7 +74,37 @@ print(f'RADV WSI adaptation changed={changed} sha256={hashlib.sha256(text.encode
 # These startup-only diagnostics avoid repeated full game runs for each stage.
 for relative, replacements in {
     # Restore the pinned upload path: explicit CPU flush did not affect HUD corruption.
-    'src/amd/vulkan/radv_cmd_buffer.c': [],
+    'src/amd/vulkan/radv_cmd_buffer.c': [
+        # EglantinePS5: no stream split inside an emulated task draw. Its chunks' records prepass
+        # is a dispatch (radv_before_dispatch splits), after which the chunk's mesh draw went out
+        # without the graphics state the split reset. The split stays due and falls before the
+        # next draw or dispatch outside the task draw (about 512K words of headroom are left).
+        ('static void\nradv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer)\n{',
+         'static _Thread_local unsigned radv_task_emu_depth;\n\nstatic void\nradv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer)\n{'),
+        ('   if (likely(!device->ws->cs_split_due) || !device->ws->cs_split_due(cs->b))\n      return;',
+         '   if (likely(!device->ws->cs_split_due) || !device->ws->cs_split_due(cs->b))\n      return;\n   if (radv_task_emu_depth)\n      return;'),
+        ('static void\nradv_task_emu_draw_direct(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)\n{',
+         'static void\nradv_task_emu_draw_direct_body(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z);\n\n'
+         'static void\nradv_task_emu_draw_direct(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)\n{\n'
+         '   radv_task_emu_depth++;\n   radv_task_emu_draw_direct_body(cmd_buffer, x, y, z);\n   radv_task_emu_depth--;\n}\n\n'
+         'static void\nradv_task_emu_draw_direct_body(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)\n{'),
+        ('static void\nradv_task_emu_draw_indirect(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{',
+         'static void\nradv_task_emu_draw_indirect_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info);\n\n'
+         'static void\nradv_task_emu_draw_indirect(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{\n'
+         '   radv_task_emu_depth++;\n   radv_task_emu_draw_indirect_body(cmd_buffer, info);\n   radv_task_emu_depth--;\n}\n\n'
+         'static void\nradv_task_emu_draw_indirect_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{'),
+        # The same for a draw whose mesh shader runs as compute (tools/patch-radv-series): its chunks'
+        # records pass is a dispatch too, and a split there would leave its copy draws without the
+        # graphics state. exploitizm's build has no such guard. The split that falls due goes first,
+        # where radv_before_taskmesh_draw puts it for an emulated task draw: the only split point of
+        # this draw is the radv_before_draw inside the guard, and a run of these draws alone would
+        # otherwise never split and pass the submission limit.
+        ('static void\nradv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,\n                       uint32_t z)\n{',
+         'static void\nradv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,\n                            uint32_t z);\n\n'
+         'static void\nradv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,\n                       uint32_t z)\n{\n'
+         '   radv_split_cmd_stream_if_due(cmd_buffer);\n   radv_task_emu_depth++;\n   radv_mesh_compute_draw_body(cmd_buffer, info, x, y, z);\n   radv_task_emu_depth--;\n}\n\n'
+         'static void\nradv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,\n                            uint32_t z)\n{'),
+    ],
     'src/amd/vulkan/radv_physical_device.c': [
         ('   if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)\n      return VK_SUCCESS;',
          '   if (result != VK_SUCCESS) fprintf(stderr, "radv/ps5: physical device creation result=%d\\n", result);\n   if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)\n      return VK_SUCCESS;'),
@@ -98,7 +128,11 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
         ('   if (!placed) {', '   if (!placed) {\n      fprintf(stderr, "radv/ps5: mapping rejected result=%d address=%p bytes=%llu window32=%d\\n", result, address, (unsigned long long)bytes, window32);'),
     ],
 }.items():
-    original = root.parent/'mihawk-mesa-review'/relative
+    # What tools/patch-radv-series.py made of the file (T120's mesh-as-compute series), if it
+    # touched it; the pinned checkout otherwise.
+    original = root.parent/'mihawk-vulkan-review/.deps/work/radv-series'/relative
+    if not original.exists():
+        original = root.parent/'mihawk-mesa-review'/relative
     destination = root.parent/'mihawk-vulkan-review/.deps/work/radv-src'/relative
     adapted = original.read_text()
     for old, new in replacements:

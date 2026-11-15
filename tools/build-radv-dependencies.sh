@@ -41,6 +41,10 @@ p.write_text(s)
 PY
 bash "$vulkan/tools/setup-native-dependencies.sh"
 bash "$vulkan/tools/build-radv.sh" release
+# T120's driver series first (mesh shaders of emulated task draws run as compute: the NGG mesh
+# draw hangs the base PS5 GPU in Ocarina's first 3D scene). Off unless EDEN_NX2_RADV_MESH_COMPUTE=1;
+# patch-radv-wsi.py then starts from the series' copy of the files it touched.
+python3 "$root/tools/patch-radv-series.py"
 python3 "$root/tools/patch-radv-wsi.py"
 python3 "$root/tools/patch-radv-disk-cache.py"
 python3 "$root/tools/patch-radv-memory-report.py"
