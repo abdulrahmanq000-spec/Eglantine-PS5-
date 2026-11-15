@@ -636,3 +636,17 @@ Last TakeLast(const std::string& logs_folder, const std::string& eden_log) {
 }
 
 } // namespace Eden::Crash
+
+// Hooks of T120's RADV series (tools/patch-radv-series). RADV declares them weak, but the package
+// check refuses an import no system module provides, so they are defined here.
+extern "C" {
+// The driver's stall dump on request: RADV's winsys sets this when it creates its queue with
+// EDEN_NX2_RADV_STALL_DUMP=1 (lead-mesh-02); null otherwise, and nothing in this core calls it.
+void (*eden_radv_stall_dump)(void) = nullptr;
+
+// Called by the driver's stall dump (lead-mesh-01, only with EDEN_NX2_RADV_STALL_DUMP=1) once a
+// submission has made no progress, before anything there could fault.
+void eden_gpu_stalled(void) {
+    std::fputs("EDEN_GPU_STALLED the driver found the GPU stopped on a submission\n", stderr);
+}
+}
