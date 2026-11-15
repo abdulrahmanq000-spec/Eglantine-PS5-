@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
@@ -585,6 +586,22 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
+        }
+        // EDEN_BUILTIN_OFF=<text>[,<text>...]: skip the built-ins whose name contains one of them
+        // (e.g. "Texture Pool" to try Max Resolution without the doubled graphics pool on a base
+        // PS5, whose pool ran out with both). The launcher's Mods list has no row for built-ins.
+        if (const char* off = std::getenv("EDEN_BUILTIN_OFF"); off != nullptr && *off != '\0') {
+            bool skip = false;
+            for (std::string_view rest{off}; !rest.empty() && !skip;) {
+                const auto comma = rest.find(',');
+                const auto word = rest.substr(0, comma);
+                skip = !word.empty() && patch.name.find(word) != std::string_view::npos;
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            }
+            if (skip) {
+                LOG_INFO(Loader, "    - Skipping \"{}\": EDEN_BUILTIN_OFF", patch.name);
+                continue;
+            }
         }
         if (std::find(replaced.cbegin(), replaced.cend(), patch.name) != replaced.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": included in an applied built-in patch",
