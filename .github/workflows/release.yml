@@ -206,6 +206,22 @@ jobs:
           ccache --zero-stats
           bash tools/ci/build-release.sh
 
+      # Crash report addresses (eboot+offset = an address in build/symbols' llvm-pie.elf) resolved
+      # here, since the symbols artifact cannot be fetched where the reports are read.
+      - name: Symbolize crash addresses
+        if: always() && hashFiles('tools/ci/crash-addresses.txt') != ''
+        run: |
+          elf=$(find build/symbols build -name 'llvm-pie.elf' -print -quit 2>/dev/null || true)
+          [[ -n $elf ]] || elf=$(find build/symbols -type f -name '*.elf' -print -quit)
+          tool=$(command -v llvm-addr2line || ls /usr/bin/llvm-addr2line-* 2>/dev/null | sort -V | tail -1 || true)
+          [[ -n $tool ]] || tool=$(find "$(dirname "$GITHUB_WORKSPACE")" -name 'llvm-addr2line' -type f 2>/dev/null | head -1)
+          [[ -n $tool ]] || tool=addr2line
+          echo "elf=$elf tool=$tool"; sha256sum build/release/PPSA98515/eboot.bin || true
+          grep -v '^#' tools/ci/crash-addresses.txt | while read -r a; do
+            [[ -n $a ]] || continue
+            echo "== $a"; "$tool" -f -C -i -e "$elf" "$a" || true
+          done
+
       - name: Report disk, ccache and the linker
         if: always()
         run: |
