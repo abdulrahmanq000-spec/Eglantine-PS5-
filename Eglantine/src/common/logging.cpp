@@ -307,6 +307,20 @@ struct FileBackend final : public Backend {
         if (Settings::values.log_flush_line.GetValue())
             file->Flush();
 
+        // Diagnostic build: flush at most every 250 ms, so a session closed from the PS5 menu
+        // keeps everything but its last moments (lines below Error otherwise sat in the buffer
+        // and were lost: the black-screen logs ended right after nx2:gsv 903).
+        // EDEN_LOG_FLUSH_LINE=1 in env.txt flushes every line instead.
+        static const bool flush_every_line = [] {
+            const char* value = ::getenv("EDEN_LOG_FLUSH_LINE");
+            return value != nullptr && value[0] == '1';
+        }();
+        const auto now = std::chrono::steady_clock::now();
+        if (flush_every_line || now - last_flush >= std::chrono::milliseconds{250}) {
+            last_flush = now;
+            file->Flush();
+        }
+
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
         const auto write_limit = Settings::values.extended_logging.GetValue() ? 1_GiB : 100_MiB;
@@ -327,6 +341,7 @@ private:
     std::optional<FS::IOFile> file;
     std::size_t bytes_written = 0;
     bool enabled = true;
+    std::chrono::steady_clock::time_point last_flush{};
 };
 #endif
 /// @brief Backend that keeps the last lines in memory, off unless the debug server turns it on
